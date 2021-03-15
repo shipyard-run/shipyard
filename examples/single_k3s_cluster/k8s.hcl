@@ -1,6 +1,6 @@
 k8s_cluster "k3s" {
-  driver  = "k3s" // default
-  version = "v1.17.4-k3s1"
+  driver  = "k3s" // defaultA
+  version = "v1.18.16"
 
   nodes = 1 // default
 
