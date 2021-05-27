@@ -11,7 +11,7 @@ helm "consul" {
 
 helm "vault" {
   cluster = "k8s_cluster.k3s"
-  chart = "github.com/hashicorp/vault-helm"
+  chart = "github.com/hashicorp/vault-helm?ref=v0.11.0"
 
   values_string = {
     "server.dataStorage.size" = "128Mb",
