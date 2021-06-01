@@ -515,7 +515,7 @@ func (d *DockerTasks) CopyLocalDockerImagesToVolume(images []string, volume stri
 	savedImages := []string{}
 
 	for _, i := range images {
-		compressedImageName := fmt.Sprintf("%s", base64.StdEncoding.EncodeToString([]byte(i)))
+		compressedImageName := fmt.Sprintf("%s", base64.RawURLEncoding.EncodeToString([]byte(i)))
 
 		d.l.Debug("Copying image to container", "image", i)
 		imageFile, err := d.saveImageToTempFile(i, compressedImageName)

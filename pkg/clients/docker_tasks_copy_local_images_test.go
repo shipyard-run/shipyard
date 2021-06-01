@@ -91,7 +91,7 @@ func TestCopyLocalDoesNothingWhenCached(t *testing.T) {
 		Cmd: []string{
 			"find",
 			"/cache/images/" +
-				base64.StdEncoding.EncodeToString([]byte(testCopyLocalImages[0])),
+				base64.RawURLEncoding.EncodeToString([]byte(testCopyLocalImages[0])),
 		},
 		WorkingDir:   "/",
 		AttachStdout: true,
