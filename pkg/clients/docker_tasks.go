@@ -591,7 +591,7 @@ func (d *DockerTasks) CopyFilesToVolume(volumeID string, filenames []string, pat
 			return nil, fmt.Errorf("Unable to copy file %s to container: %s", f, err)
 		}
 
-		imported = append(imported, destFile)
+		imported = append(imported, filepath.ToSlash(destFile))
 	}
 
 	return imported, nil
