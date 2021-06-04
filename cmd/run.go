@@ -69,6 +69,7 @@ func newRunCmdFunc(e shipyard.Engine, bp clients.Getter, hc clients.HTTP, bc cli
 		if *force == true {
 			bp.SetForce(true)
 			e.GetClients().ContainerTasks.SetForcePull(true)
+			e.GetClients().Getter.SetForce(true)
 		}
 
 		// parse the vars into a map

@@ -1,10 +1,28 @@
-package config
+package parser
 
 import (
 	"io/ioutil"
 	"os"
 	"testing"
+
+	"github.com/shipyard-run/shipyard/pkg/config"
+	"github.com/stretchr/testify/assert"
 )
+
+func setupTestConfig(t *testing.T, contents string) (*config.Config, string, func()) {
+	e, _ := setup(t)
+	dir, cleanup := createTestFiles(t)
+	createNamedFile(t, dir, "*.hcl", contents)
+
+	c := config.New()
+	err := e.ParseFolder(dir, c, false, "", false, []string{}, nil, "")
+	assert.NoError(t, err)
+
+	err = e.ParseReferences(c)
+	assert.NoError(t, err)
+
+	return c, dir, cleanup
+}
 
 // createsTestFiles creates a temporary directory and
 // stores temp files into it

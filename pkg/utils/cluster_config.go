@@ -48,6 +48,8 @@ func (n *ClusterConfig) Load(file string) error {
 		return err
 	}
 
+	defer f.Close()
+
 	return json.NewDecoder(f).Decode(n)
 }
 

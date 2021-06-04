@@ -1,17 +1,20 @@
-package config
+package parser
 
 import (
 	"testing"
 
+	"github.com/shipyard-run/shipyard/pkg/config"
 	"github.com/stretchr/testify/assert"
 )
 
-func setupBlueprints(t *testing.T, contents string) (*Config, func()) {
+func setupBlueprints(t *testing.T, contents string) (*config.Config, func()) {
+	p, _ := setup(t)
+
 	dir, cleanup := createTestFiles(t)
 	createNamedFile(t, dir, "*.yard", contents)
 
-	c := &Config{}
-	err := ParseFolder(dir, c, false, "", false, []string{}, nil, "")
+	c := &config.Config{}
+	err := p.ParseFolder(dir, c, false, "", false, []string{}, nil, "")
 	assert.NoError(t, err)
 
 	return c, cleanup

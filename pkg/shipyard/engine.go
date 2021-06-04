@@ -19,6 +19,7 @@ import (
 	// "github.com/mitchellh/mapstructure"
 	"github.com/shipyard-run/shipyard/pkg/clients"
 	"github.com/shipyard-run/shipyard/pkg/config"
+	"github.com/shipyard-run/shipyard/pkg/parser"
 	"github.com/shipyard-run/shipyard/pkg/providers"
 	"github.com/shipyard-run/shipyard/pkg/utils"
 )
@@ -37,6 +38,7 @@ type Clients struct {
 	Browser        clients.System
 	ImageLog       clients.ImageLog
 	Connector      clients.Connector
+	Parser         *parser.Parser
 }
 
 // Engine defines an interface for the Shipyard engine
@@ -97,6 +99,8 @@ func GenerateClients(l hclog.Logger) (*Clients, error) {
 	co := clients.DefaultConnectorOptions()
 	cc := clients.NewConnector(co)
 
+	p := parser.New(bp)
+
 	return &Clients{
 		ContainerTasks: ct,
 		Docker:         dc,
@@ -110,6 +114,7 @@ func GenerateClients(l hclog.Logger) (*Clients, error) {
 		Browser:        bc,
 		ImageLog:       il,
 		Connector:      cc,
+		Parser:         p,
 	}, nil
 }
 
@@ -395,19 +400,19 @@ func (e *EngineImpl) readConfig(path string, variables map[string]string, variab
 
 	if path != "" {
 		if utils.IsHCLFile(path) {
-			err := config.ParseSingleFile(path, cc, variables, variablesFile)
+			err := e.clients.Parser.ParseFile(path, cc, variables, variablesFile)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			err := config.ParseFolder(path, cc, false, "", false, []string{}, variables, variablesFile)
+			err := e.clients.Parser.ParseFolder(path, cc, false, "", false, []string{}, variables, variablesFile)
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		// if we are loading from files create the deps
-		config.ParseReferences(cc)
+		e.clients.Parser.ParseReferences(cc)
 	}
 
 	// merge the state and items to be created or deleted

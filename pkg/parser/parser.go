@@ -1,7 +1,6 @@
-package config
+package parser
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -12,18 +11,21 @@ import (
 	"strings"
 
 	"github.com/gernest/front"
-	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/hcl2/gohcl"
 	"github.com/hashicorp/hcl2/hcl"
 	"github.com/hashicorp/hcl2/hcl/hclsyntax"
 	"github.com/hashicorp/hcl2/hclparse"
+	"github.com/shipyard-run/shipyard/pkg/clients"
+	"github.com/shipyard-run/shipyard/pkg/config"
 	"github.com/shipyard-run/shipyard/pkg/utils"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/function"
 	"golang.org/x/xerrors"
 )
 
-var ctx *hcl.EvalContext
+var NewGetter = func(forceUpdate bool) clients.Getter {
+	return clients.NewGetter(forceUpdate)
+}
 
 type ResourceTypeNotExistError struct {
 	Type string
@@ -34,21 +36,32 @@ func (r ResourceTypeNotExistError) Error() string {
 	return fmt.Sprintf("Resource type %s defined in file %s, does not exist. Please check the documentation for supported resources. We love PRs if you would like to create a resource of this type :)", r.Type, r.File)
 }
 
-func ParseSingleFile(file string, c *Config, variables map[string]string, variablesFile string) error {
-	ctx = buildContext()
-	return parseFile(file, c, variables, variablesFile)
+type Parser struct {
+	ctx    *hcl.EvalContext
+	getter clients.Getter
+}
+
+func New(g clients.Getter) *Parser {
+	return &Parser{getter: g}
+}
+
+func (p *Parser) ParseFile(file string, c *config.Config, variables map[string]string, variablesFile string) error {
+	p.ctx = buildContext()
+
+	return p.parseFile(file, c, variables, variablesFile)
 }
 
 // ParseFolder for Resource, Blueprint, and Variable files
-// The onlyResources parameter allows you to specify that the parser
+// forceUpdate always downloads a new copy of remote modules, if set to false, cached copy is used.
+// onlyResources parameter allows you to specify that the parser
 // moduleName is the name of the module, this should be set to a blank string for the root module
 // disabled sets the disabled flag on all resources, this is used when parsing a module that
 //  has the disabled flag set
 // only reads resource files and will ignore Blueprint and Variable files.
 // This is useful when recursively parsing such as when reading Modules
-func ParseFolder(
+func (p *Parser) ParseFolder(
 	folder string,
-	c *Config,
+	c *config.Config,
 	onlyResources bool,
 	moduleName string,
 	disabled bool,
@@ -56,8 +69,8 @@ func ParseFolder(
 	variables map[string]string,
 	variablesFile string) error {
 
-	ctx = buildContext()
-	return parseFolder(
+	p.ctx = buildContext()
+	return p.parseFolder(
 		folder,
 		c,
 		onlyResources,
@@ -69,21 +82,63 @@ func ParseFolder(
 	)
 }
 
-func parseFile(file string, c *Config, variables map[string]string, variablesFile string) error {
-	SetVariables(variables)
+// LoadValuesFile loads variable values from a file
+func (p *Parser) LoadValuesFile(path string) error {
+	hp := hclparse.NewParser()
+
+	f, diag := hp.ParseHCLFile(path)
+	if diag.HasErrors() {
+		return errors.New(diag.Error())
+	}
+
+	// add the file functions to the context with a reference to the
+	// current file
+	p.ctx.Functions["file_path"] = getFilePathFunc(path)
+	p.ctx.Functions["file_dir"] = getFileDirFunc(path)
+	p.ctx.Functions["file"] = getFileContentFunc(path)
+
+	attrs, _ := f.Body.JustAttributes()
+	for name, attr := range attrs {
+		val, _ := attr.Expr.Value(p.ctx)
+
+		p.setContextVariable(name, val)
+	}
+
+	return nil
+}
+
+// SetVariables allow variables to be set from a collection or environment variables
+// Precedence should be file, env, vars
+func (p *Parser) SetVariables(vars map[string]string) {
+	// first any vars defined as environment variables
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "SY_VAR_") {
+			parts := strings.Split(e, "=")
+			p.setContextVariable(strings.Replace(parts[0], "SY_VAR_", "", -1), parts[1])
+		}
+	}
+
+	// then set vars
+	for k, v := range vars {
+		p.setContextVariable(k, v)
+	}
+}
+
+func (p *Parser) parseFile(file string, c *config.Config, variables map[string]string, variablesFile string) error {
+	p.SetVariables(variables)
 	if variablesFile != "" {
-		err := LoadValuesFile(variablesFile)
+		err := p.LoadValuesFile(variablesFile)
 		if err != nil {
 			return err
 		}
 	}
 
-	err := parseVariableFile(file, c)
+	err := p.parseVariableFile(file, c)
 	if err != nil {
 		return err
 	}
 
-	err = parseHCLFile(file, c, "", false, []string{})
+	err = p.parseHCLFile(file, c, "", false, []string{})
 	if err != nil {
 		return err
 	}
@@ -91,9 +146,9 @@ func parseFile(file string, c *Config, variables map[string]string, variablesFil
 	return nil
 }
 
-func parseFolder(
+func (p *Parser) parseFolder(
 	folder string,
-	c *Config,
+	c *config.Config,
 	onlyResources bool,
 	moduleName string,
 	disabled bool,
@@ -111,7 +166,7 @@ func parseFolder(
 		}
 
 		for _, f := range variableFiles {
-			err := LoadValuesFile(f)
+			err := p.LoadValuesFile(f)
 			if err != nil {
 				return err
 			}
@@ -119,14 +174,14 @@ func parseFolder(
 
 		// load variables from any custom files set on the command line
 		if variablesFile != "" {
-			err := LoadValuesFile(variablesFile)
+			err := p.LoadValuesFile(variablesFile)
 			if err != nil {
 				return err
 			}
 		}
 
 		// setup any variables which are passed as environment variables or in the collection
-		SetVariables(variables)
+		p.SetVariables(variables)
 
 		// pick up the blueprint file
 		yardFilesHCL, err := filepath.Glob(path.Join(abs, "*.yard"))
@@ -144,7 +199,7 @@ func parseFolder(
 		yardFiles = append(yardFiles, yardFilesMD...)
 
 		if len(yardFiles) > 0 {
-			err := parseYardFile(yardFiles[0], c)
+			err := p.parseYardFile(yardFiles[0], c)
 			if err != nil {
 				return err
 			}
@@ -153,19 +208,19 @@ func parseFolder(
 
 	// We need to do a two pass parsing, first we check if there are any
 	// default variables which should be added to the collection
-	err := parseVariables(abs, c)
+	err := p.parseVariables(abs, c)
 	if err != nil {
 		return err
 	}
 
 	// Parse Resource files from the current folder
-	err = parseResources(abs, c, moduleName, disabled, dependsOn)
+	err = p.parseResources(abs, c, moduleName, disabled, dependsOn)
 	if err != nil {
 		return err
 	}
 
 	// Finally parse the outputs
-	err = parseOutputs(abs, disabled, c)
+	err = p.parseOutputs(abs, disabled, c)
 	if err != nil {
 		return err
 	}
@@ -174,62 +229,22 @@ func parseFolder(
 }
 
 // ParseYardFile parses a blueprint configuration file
-func parseYardFile(file string, c *Config) error {
+func (p *Parser) parseYardFile(file string, c *config.Config) error {
 	if filepath.Ext(file) == ".yard" {
-		return parseYardHCL(file, c)
+		return p.parseYardHCL(file, c)
 	}
 
-	return parseYardMarkdown(file, c)
-}
-
-// LoadValuesFile loads variable values from a file
-func LoadValuesFile(path string) error {
-	parser := hclparse.NewParser()
-
-	f, diag := parser.ParseHCLFile(path)
-	if diag.HasErrors() {
-		return errors.New(diag.Error())
-	}
-
-	// add the file functions to the context with a reference to the
-	// current file
-	ctx.Functions["file_path"] = getFilePathFunc(path)
-	ctx.Functions["file_dir"] = getFileDirFunc(path)
-
-	attrs, _ := f.Body.JustAttributes()
-	for name, attr := range attrs {
-		val, _ := attr.Expr.Value(ctx)
-
-		setContextVariable(name, val)
-	}
-
-	return nil
-}
-
-// SetVariables allow variables to be set from a collection or environment variables
-// Precedence should be file, env, vars
-func SetVariables(vars map[string]string) {
-	// first any vars defined as environment variables
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "SY_VAR_") {
-			parts := strings.Split(e, "=")
-			setContextVariable(strings.Replace(parts[0], "SY_VAR_", "", -1), parts[1])
-		}
-	}
-
-	// then set vars
-	for k, v := range vars {
-		setContextVariable(k, v)
-	}
+	return p.parseYardMarkdown(file, c)
 }
 
 // ParseVariableFile parses a config file for variables
-func parseVariableFile(file string, c *Config) error {
-	parser := hclparse.NewParser()
-	ctx.Functions["file_path"] = getFilePathFunc(file)
-	ctx.Functions["file_dir"] = getFileDirFunc(file)
+func (p *Parser) parseVariableFile(file string, c *config.Config) error {
+	hp := hclparse.NewParser()
+	p.ctx.Functions["file_path"] = getFilePathFunc(file)
+	p.ctx.Functions["file_dir"] = getFileDirFunc(file)
+	p.ctx.Functions["file"] = getFileContentFunc(file)
 
-	f, diag := parser.ParseHCLFile(file)
+	f, diag := hp.ParseHCLFile(file)
 	if diag.HasErrors() {
 		return errors.New(diag.Error())
 	}
@@ -241,16 +256,16 @@ func parseVariableFile(file string, c *Config) error {
 
 	for _, b := range body.Blocks {
 		switch b.Type {
-		case string(TypeVariable):
-			v := NewVariable(b.Labels[0])
+		case string(config.TypeVariable):
+			v := config.NewVariable(b.Labels[0])
 
-			err := decodeBody(file, b, v)
+			err := p.decodeBody(file, b, v)
 			if err != nil {
 				return err
 			}
 
-			val, _ := v.Default.(*hcl.Attribute).Expr.Value(ctx)
-			setContextVariableIfMissing(v.Name, val)
+			val, _ := v.Default.(*hcl.Attribute).Expr.Value(p.ctx)
+			p.setContextVariableIfMissing(v.Name, val)
 		}
 	}
 
@@ -258,10 +273,11 @@ func parseVariableFile(file string, c *Config) error {
 }
 
 // parseHCLFile parses a config file and adds it to the config
-func parseHCLFile(file string, c *Config, moduleName string, disabled bool, dependsOn []string) error {
+func (p *Parser) parseHCLFile(file string, c *config.Config, moduleName string, disabled bool, dependsOn []string) error {
 	parser := hclparse.NewParser()
-	ctx.Functions["file_path"] = getFilePathFunc(file)
-	ctx.Functions["file_dir"] = getFileDirFunc(file)
+	p.ctx.Functions["file_path"] = getFilePathFunc(file)
+	p.ctx.Functions["file_dir"] = getFileDirFunc(file)
+	p.ctx.Functions["file"] = getFileContentFunc(file)
 
 	f, diag := parser.ParseHCLFile(file)
 	if diag.HasErrors() {
@@ -277,22 +293,22 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 		//fmt.Printf("Parsing: %s, type: %s\n", file, b.Type)
 
 		switch b.Type {
-		case string(TypeVariable):
+		case string(config.TypeVariable):
 			// do nothing this is only here to
 			// stop the resource not found error
 			continue
 
-		case string(TypeOutput):
+		case string(config.TypeOutput):
 			// do nothing this is only here to
 			// stop the resource not found error
 			continue
 
-		case string(TypeK8sCluster):
-			cl := NewK8sCluster(b.Labels[0])
+		case string(config.TypeK8sCluster):
+			cl := config.NewK8sCluster(b.Labels[0])
 			cl.Info().Module = moduleName
 			cl.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, cl)
+			err := p.decodeBody(file, b, cl)
 			if err != nil {
 				return err
 			}
@@ -316,12 +332,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeK8sConfig):
-			h := NewK8sConfig(b.Labels[0])
+		case string(config.TypeK8sConfig):
+			h := config.NewK8sConfig(b.Labels[0])
 			h.Info().Module = moduleName
 			h.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, h)
+			err := p.decodeBody(file, b, h)
 			if err != nil {
 				return err
 			}
@@ -344,12 +360,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeHelm):
-			h := NewHelm(b.Labels[0])
+		case string(config.TypeHelm):
+			h := config.NewHelm(b.Labels[0])
 			h.Info().Module = moduleName
 			h.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, h)
+			err := p.decodeBody(file, b, h)
 			if err != nil {
 				return err
 			}
@@ -382,12 +398,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeK8sIngress):
-			i := NewK8sIngress(b.Labels[0])
+		case string(config.TypeK8sIngress):
+			i := config.NewK8sIngress(b.Labels[0])
 			i.Info().Module = moduleName
 			i.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, i)
+			err := p.decodeBody(file, b, i)
 			if err != nil {
 				return err
 			}
@@ -405,12 +421,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeNomadCluster):
-			cl := NewNomadCluster(b.Labels[0])
+		case string(config.TypeNomadCluster):
+			cl := config.NewNomadCluster(b.Labels[0])
 			cl.Info().Module = moduleName
 			cl.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, cl)
+			err := p.decodeBody(file, b, cl)
 			if err != nil {
 				return err
 			}
@@ -434,12 +450,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeNomadJob):
-			h := NewNomadJob(b.Labels[0])
+		case string(config.TypeNomadJob):
+			h := config.NewNomadJob(b.Labels[0])
 			h.Info().Module = moduleName
 			h.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, h)
+			err := p.decodeBody(file, b, h)
 			if err != nil {
 				return err
 			}
@@ -462,12 +478,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeNomadIngress):
-			i := NewNomadIngress(b.Labels[0])
+		case string(config.TypeNomadIngress):
+			i := config.NewNomadIngress(b.Labels[0])
 			i.Info().Module = moduleName
 			i.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, i)
+			err := p.decodeBody(file, b, i)
 			if err != nil {
 				return err
 			}
@@ -485,12 +501,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeNetwork):
-			n := NewNetwork(b.Labels[0])
+		case string(config.TypeNetwork):
+			n := config.NewNetwork(b.Labels[0])
 			n.Info().Module = moduleName
 			n.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, n)
+			err := p.decodeBody(file, b, n)
 			if err != nil {
 				return err
 			}
@@ -509,18 +525,18 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 			}
 
 			// always add this network as a dependency of the image cache
-			ics := c.FindResourcesByType(string(TypeImageCache))
+			ics := c.FindResourcesByType(string(config.TypeImageCache))
 			if ics != nil && len(ics) == 1 {
-				ic := ics[0].(*ImageCache)
+				ic := ics[0].(*config.ImageCache)
 				ic.DependsOn = append(ic.DependsOn, "network."+n.Name)
 			}
 
-		case string(TypeIngress):
-			i := NewIngress(b.Labels[0])
+		case string(config.TypeIngress):
+			i := config.NewIngress(b.Labels[0])
 			i.Info().Module = moduleName
 			i.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, i)
+			err := p.decodeBody(file, b, i)
 			if err != nil {
 				return err
 			}
@@ -538,12 +554,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeContainer):
-			co := NewContainer(b.Labels[0])
+		case string(config.TypeContainer):
+			co := config.NewContainer(b.Labels[0])
 			co.Info().Module = moduleName
 			co.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, co)
+			err := p.decodeBody(file, b, co)
 			if err != nil {
 				return err
 			}
@@ -574,12 +590,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeContainerIngress):
-			i := NewContainerIngress(b.Labels[0])
+		case string(config.TypeContainerIngress):
+			i := config.NewContainerIngress(b.Labels[0])
 			i.Info().Module = moduleName
 			i.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, i)
+			err := p.decodeBody(file, b, i)
 			if err != nil {
 				return err
 			}
@@ -597,12 +613,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeSidecar):
-			s := NewSidecar(b.Labels[0])
+		case string(config.TypeSidecar):
+			s := config.NewSidecar(b.Labels[0])
 			s.Info().Module = moduleName
 			s.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, s)
+			err := p.decodeBody(file, b, s)
 			if err != nil {
 				return err
 			}
@@ -624,12 +640,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeDocs):
-			do := NewDocs(b.Labels[0])
+		case string(config.TypeDocs):
+			do := config.NewDocs(b.Labels[0])
 			do.Info().Module = moduleName
 			do.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, do)
+			err := p.decodeBody(file, b, do)
 			if err != nil {
 				return err
 			}
@@ -649,12 +665,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeExecLocal):
-			h := NewExecLocal(b.Labels[0])
+		case string(config.TypeExecLocal):
+			h := config.NewExecLocal(b.Labels[0])
 			h.Info().Module = moduleName
 			h.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, h)
+			err := p.decodeBody(file, b, h)
 			if err != nil {
 				return err
 			}
@@ -672,12 +688,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeExecRemote):
-			h := NewExecRemote(b.Labels[0])
+		case string(config.TypeExecRemote):
+			h := config.NewExecRemote(b.Labels[0])
 			h.Info().Module = moduleName
 			h.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, h)
+			err := p.decodeBody(file, b, h)
 			if err != nil {
 				return err
 			}
@@ -701,12 +717,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeTemplate):
-			i := NewTemplate(b.Labels[0])
+		case string(config.TypeTemplate):
+			i := config.NewTemplate(b.Labels[0])
 			i.Info().Module = moduleName
 			i.Info().DependsOn = dependsOn
 
-			err := decodeBody(file, b, i)
+			err := p.decodeBody(file, b, i)
 			if err != nil {
 				return err
 			}
@@ -726,12 +742,12 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 				)
 			}
 
-		case string(TypeModule):
+		case string(config.TypeModule):
 			moduleName := b.Labels[0]
-			m := NewModule(moduleName)
+			m := config.NewModule(moduleName)
 			m.Info().Module = moduleName
 
-			err := decodeBody(file, b, m)
+			err := p.decodeBody(file, b, m)
 			if err != nil {
 				return err
 			}
@@ -740,7 +756,7 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 			if !utils.IsLocalFolder(ensureAbsolute(m.Source, file)) {
 				// get the details
 				dst := utils.GetBlueprintLocalFolder(m.Source)
-				err := getFiles(m.Source, dst)
+				err := p.getFiles(m.Source, dst)
 				if err != nil {
 					return err
 				}
@@ -757,7 +773,7 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 
 			// recursively parse references for the module
 			// ensure we do load the values which might be in module folders
-			err = parseFolder(m.Source, c, true, moduleName, m.Disabled, m.Depends, nil, "")
+			err = p.parseFolder(m.Source, c, true, moduleName, m.Disabled, m.Depends, nil, "")
 			if err != nil {
 				return err
 			}
@@ -766,8 +782,9 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 			// into other folders. They should have a separate context but
 			// for now just reset the file path to ensure any other resources
 			// parsed after the module have the correct path
-			ctx.Functions["file_path"] = getFilePathFunc(file)
-			ctx.Functions["file_dir"] = getFileDirFunc(file)
+			p.ctx.Functions["file_path"] = getFilePathFunc(file)
+			p.ctx.Functions["file_dir"] = getFileDirFunc(file)
+			p.ctx.Functions["file"] = getFileContentFunc(file)
 
 		default:
 			return ResourceTypeNotExistError{string(b.Type), file}
@@ -778,38 +795,38 @@ func parseHCLFile(file string, c *Config, moduleName string, disabled bool, depe
 }
 
 // ParseReferences links the object references in config elements
-func ParseReferences(c *Config) error {
+func (p *Parser) ParseReferences(c *config.Config) error {
 	for _, r := range c.Resources {
 		switch r.Info().Type {
-		case TypeContainer:
-			c := r.(*Container)
+		case config.TypeContainer:
+			c := r.(*config.Container)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeContainerIngress:
-			c := r.(*ContainerIngress)
+		case config.TypeContainerIngress:
+			c := r.(*config.ContainerIngress)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Target)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeSidecar:
-			c := r.(*Sidecar)
+		case config.TypeSidecar:
+			c := r.(*config.Sidecar)
 			c.DependsOn = append(c.DependsOn, c.Target)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeDocs:
-			c := r.(*Docs)
+		case config.TypeDocs:
+			c := r.(*config.Docs)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeExecRemote:
-			c := r.(*ExecRemote)
+		case config.TypeExecRemote:
+			c := r.(*config.ExecRemote)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
@@ -821,16 +838,16 @@ func ParseReferences(c *Config) error {
 				c.DependsOn = append(c.DependsOn, c.Target)
 			}
 
-		case TypeExecLocal:
-			c := r.(*ExecLocal)
+		case config.TypeExecLocal:
+			c := r.(*config.ExecLocal)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeTemplate:
-			c := r.(*Template)
+		case config.TypeTemplate:
+			c := r.(*config.Template)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeIngress:
-			c := r.(*Ingress)
+		case config.TypeIngress:
+			c := r.(*config.Ingress)
 			if c.Source.Config.Cluster != "" {
 				c.DependsOn = append(c.DependsOn, c.Source.Config.Cluster)
 			}
@@ -841,8 +858,8 @@ func ParseReferences(c *Config) error {
 
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeK8sCluster:
-			c := r.(*K8sCluster)
+		case config.TypeK8sCluster:
+			c := r.(*config.K8sCluster)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
@@ -850,46 +867,46 @@ func ParseReferences(c *Config) error {
 
 			// always add a dependency of the cache as this is
 			// required by all clusters
-			c.DependsOn = append(c.DependsOn, fmt.Sprintf("%s.%s", TypeImageCache, utils.CacheResourceName))
+			c.DependsOn = append(c.DependsOn, fmt.Sprintf("%s.%s", config.TypeImageCache, utils.CacheResourceName))
 
-		case TypeHelm:
-			c := r.(*Helm)
+		case config.TypeHelm:
+			c := r.(*config.Helm)
 			c.DependsOn = append(c.DependsOn, c.Cluster)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeK8sConfig:
-			c := r.(*K8sConfig)
+		case config.TypeK8sConfig:
+			c := r.(*config.K8sConfig)
 			c.DependsOn = append(c.DependsOn, c.Cluster)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeK8sIngress:
-			c := r.(*K8sIngress)
+		case config.TypeK8sIngress:
+			c := r.(*config.K8sIngress)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Cluster)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeNomadCluster:
-			c := r.(*NomadCluster)
+		case config.TypeNomadCluster:
+			c := r.(*config.NomadCluster)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 			// always add a dependency of the cache as this is
 			// required by all clusters
-			c.DependsOn = append(c.DependsOn, fmt.Sprintf("%s.%s", TypeImageCache, utils.CacheResourceName))
+			c.DependsOn = append(c.DependsOn, fmt.Sprintf("%s.%s", config.TypeImageCache, utils.CacheResourceName))
 
-		case TypeNomadIngress:
-			c := r.(*NomadIngress)
+		case config.TypeNomadIngress:
+			c := r.(*config.NomadIngress)
 			for _, n := range c.Networks {
 				c.DependsOn = append(c.DependsOn, n.Name)
 			}
 			c.DependsOn = append(c.DependsOn, c.Cluster)
 			c.DependsOn = append(c.DependsOn, c.Depends...)
 
-		case TypeNomadJob:
-			c := r.(*NomadJob)
+		case config.TypeNomadJob:
+			c := r.(*config.NomadJob)
 			c.DependsOn = append(c.DependsOn, c.Cluster)
 		}
 	}
@@ -897,14 +914,14 @@ func ParseReferences(c *Config) error {
 	return nil
 }
 
-func parseVariables(abs string, c *Config) error {
+func (p *Parser) parseVariables(abs string, c *config.Config) error {
 	files, err := filepath.Glob(path.Join(abs, "*.hcl"))
 	if err != nil {
 		return err
 	}
 
 	for _, f := range files {
-		err := parseVariableFile(f, c)
+		err := p.parseVariableFile(f, c)
 		if err != nil {
 			return err
 		}
@@ -913,14 +930,14 @@ func parseVariables(abs string, c *Config) error {
 	return nil
 }
 
-func parseOutputs(abs string, disabled bool, c *Config) error {
+func (p *Parser) parseOutputs(abs string, disabled bool, c *config.Config) error {
 	files, err := filepath.Glob(path.Join(abs, "*.hcl"))
 	if err != nil {
 		return err
 	}
 
 	for _, f := range files {
-		err := parseOutputFile(f, disabled, c)
+		err := p.parseOutputFile(f, disabled, c)
 		if err != nil {
 			return err
 		}
@@ -929,10 +946,11 @@ func parseOutputs(abs string, disabled bool, c *Config) error {
 	return nil
 }
 
-func parseOutputFile(file string, disabled bool, c *Config) error {
+func (p *Parser) parseOutputFile(file string, disabled bool, c *config.Config) error {
 	parser := hclparse.NewParser()
-	ctx.Functions["file_path"] = getFilePathFunc(file)
-	ctx.Functions["file_dir"] = getFileDirFunc(file)
+	p.ctx.Functions["file_path"] = getFilePathFunc(file)
+	p.ctx.Functions["file_dir"] = getFileDirFunc(file)
+	p.ctx.Functions["file"] = getFileContentFunc(file)
 
 	f, diag := parser.ParseHCLFile(file)
 	if diag.HasErrors() {
@@ -946,10 +964,10 @@ func parseOutputFile(file string, disabled bool, c *Config) error {
 
 	for _, b := range body.Blocks {
 		switch b.Type {
-		case string(TypeOutput):
-			v := NewOutput(b.Labels[0])
+		case string(config.TypeOutput):
+			v := config.NewOutput(b.Labels[0])
 
-			err := decodeBody(file, b, v)
+			err := p.decodeBody(file, b, v)
 			if err != nil {
 				return err
 			}
@@ -963,14 +981,14 @@ func parseOutputFile(file string, disabled bool, c *Config) error {
 	return nil
 }
 
-func parseResources(abs string, c *Config, moduleName string, disabled bool, dependsOn []string) error {
+func (p *Parser) parseResources(abs string, c *config.Config, moduleName string, disabled bool, dependsOn []string) error {
 	files, err := filepath.Glob(path.Join(abs, "*.hcl"))
 	if err != nil {
 		return err
 	}
 
 	for _, f := range files {
-		err := parseHCLFile(f, c, moduleName, disabled, dependsOn)
+		err := p.parseHCLFile(f, c, moduleName, disabled, dependsOn)
 		if err != nil {
 			return err
 		}
@@ -979,11 +997,11 @@ func parseResources(abs string, c *Config, moduleName string, disabled bool, dep
 	return nil
 }
 
-func setContextVariable(key string, value interface{}) {
+func (p *Parser) setContextVariable(key string, value interface{}) {
 	valMap := map[string]cty.Value{}
 
 	// get the existing map
-	if m, ok := ctx.Variables["var"]; ok {
+	if m, ok := p.ctx.Variables["var"]; ok {
 		valMap = m.AsValueMap()
 	}
 
@@ -996,23 +1014,23 @@ func setContextVariable(key string, value interface{}) {
 		//fmt.Println("Adding Var", key, v)
 	}
 
-	ctx.Variables["var"] = cty.ObjectVal(valMap)
+	p.ctx.Variables["var"] = cty.ObjectVal(valMap)
 }
 
-func setContextVariableIfMissing(key string, value interface{}) {
-	if m, ok := ctx.Variables["var"]; ok {
+func (p *Parser) setContextVariableIfMissing(key string, value interface{}) {
+	if m, ok := p.ctx.Variables["var"]; ok {
 		if _, ok := m.AsValueMap()[key]; ok {
 			return
 		}
 	}
 
-	setContextVariable(key, value)
+	p.setContextVariable(key, value)
 }
 
-func parseYardHCL(file string, c *Config) error {
-	parser := hclparse.NewParser()
+func (p *Parser) parseYardHCL(file string, c *config.Config) error {
+	hp := hclparse.NewParser()
 
-	f, diag := parser.ParseHCLFile(file)
+	f, diag := hp.ParseHCLFile(file)
 	if diag.HasErrors() {
 		return errors.New(diag.Error())
 	}
@@ -1022,9 +1040,9 @@ func parseYardHCL(file string, c *Config) error {
 		return errors.New("Error getting body")
 	}
 
-	bp := &Blueprint{}
+	bp := &config.Blueprint{}
 
-	diag = gohcl.DecodeBody(body, ctx, bp)
+	diag = gohcl.DecodeBody(body, p.ctx, bp)
 	if diag.HasErrors() {
 		return errors.New(diag.Error())
 	}
@@ -1036,7 +1054,7 @@ func parseYardHCL(file string, c *Config) error {
 
 // parseYardMarkdown extracts the blueprint information from the frontmatter
 // when a blueprint file is of type markdown
-func parseYardMarkdown(file string, c *Config) error {
+func (p *Parser) parseYardMarkdown(file string, c *config.Config) error {
 	f, err := os.Open(file)
 	if err != nil {
 		return err
@@ -1051,7 +1069,7 @@ func parseYardMarkdown(file string, c *Config) error {
 		return nil
 	}
 
-	bp := &Blueprint{}
+	bp := &config.Blueprint{}
 	bp.HealthCheckTimeout = "30s"
 
 	// set the default health check
@@ -1081,11 +1099,11 @@ func parseYardMarkdown(file string, c *Config) error {
 	}
 
 	if envs, ok := fr["env"].([]interface{}); ok {
-		bp.Environment = []KV{}
+		bp.Environment = []config.KV{}
 		for _, e := range envs {
 			parts := strings.Split(e.(string), "=")
 			if len(parts) == 2 {
-				bp.Environment = append(bp.Environment, KV{Key: parts[0], Value: parts[1]})
+				bp.Environment = append(bp.Environment, config.KV{Key: parts[0], Value: parts[1]})
 			}
 		}
 	}
@@ -1093,6 +1111,20 @@ func parseYardMarkdown(file string, c *Config) error {
 	bp.Intro = body
 
 	c.Blueprint = bp
+	return nil
+}
+
+func (p *Parser) decodeBody(path string, b *hclsyntax.Block, res interface{}) error {
+	// add the current file path to the context.
+	// this allows any functions which require absolute paths to be able to
+	// build them from relative paths.
+	p.ctx.Variables["path"] = cty.StringVal(path)
+
+	diag := gohcl.DecodeBody(b.Body, p.ctx, res)
+	if diag.HasErrors() {
+		return errors.New(diag.Error())
+	}
+
 	return nil
 }
 
@@ -1177,31 +1209,6 @@ func buildContext() *hcl.EvalContext {
 		},
 	})
 
-	var FileFunc = function.New(&function.Spec{
-		Params: []function.Parameter{
-			{
-				Name:             "path",
-				Type:             cty.String,
-				AllowDynamicType: true,
-			},
-		},
-		Type: function.StaticReturnType(cty.String),
-		Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
-			// get the current file path from the context
-			path := ctx.Variables["path"].AsString()
-			// conver the file path to an absolute
-			fp := ensureAbsolute(args[0].AsString(), path)
-
-			// read the contents of the file
-			d, err := ioutil.ReadFile(fp)
-			if err != nil {
-				return cty.StringVal(""), err
-			}
-
-			return cty.StringVal(string(d)), nil
-		},
-	})
-
 	var DataFunc = function.New(&function.Spec{
 		Params: []function.Parameter{
 			{
@@ -1242,7 +1249,6 @@ func buildContext() *hcl.EvalContext {
 	ctx.Functions["k8s_config_docker"] = KubeConfigDockerFunc
 	ctx.Functions["home"] = HomeFunc
 	ctx.Functions["shipyard"] = ShipyardFunc
-	ctx.Functions["file"] = FileFunc
 	ctx.Functions["data"] = DataFunc
 	ctx.Functions["docker_ip"] = DockerIPFunc
 	ctx.Functions["docker_host"] = DockerHostFunc
@@ -1253,6 +1259,48 @@ func buildContext() *hcl.EvalContext {
 	// this is because the need a reference to the current file
 
 	return ctx
+}
+
+// ensureAbsolute ensure that the given path is either absolute or
+// if relative is converted to abasolute based on the path of the config
+func ensureAbsolute(path, file string) string {
+	// if the file starts with a / and we are on windows
+	// we should treat this as absolute
+	if runtime.GOOS == "windows" && strings.HasPrefix(path, "/") {
+		return path
+	}
+
+	if filepath.IsAbs(path) {
+		return path
+	}
+
+	// path is relative so make absolute using the current file path as base
+	file, _ = filepath.Abs(file)
+	baseDir := filepath.Dir(file)
+	return filepath.Join(baseDir, path)
+}
+
+func (p *Parser) getFiles(source, dest string) error {
+	err := p.getter.Get(source, dest)
+	if err != nil {
+		return xerrors.Errorf("unable to fetch files from %s: %w", source, err)
+	}
+
+	return nil
+}
+
+// setDisabled sets the disabled flag on a resource when the
+// parent is disabled
+func setDisabled(r config.Resource, parentDisabled bool) {
+	if parentDisabled {
+		r.Info().Disabled = true
+	}
+
+	// when the resource is disabled set the status
+	// so the engine will not create or delete it
+	if r.Info().Disabled {
+		r.Info().Status = "disabled"
+	}
 }
 
 func getFilePathFunc(path string) function.Function {
@@ -1276,73 +1324,27 @@ func getFileDirFunc(path string) function.Function {
 	})
 }
 
-func decodeBody(path string, b *hclsyntax.Block, p interface{}) error {
-	// add the current file path to the context.
-	// this allows any functions which require absolute paths to be able to
-	// build them from relative paths.
-	ctx.Variables["path"] = cty.StringVal(path)
+func getFileContentFunc(path string) function.Function {
+	return function.New(&function.Spec{
+		Params: []function.Parameter{
+			{
+				Name:             "path",
+				Type:             cty.String,
+				AllowDynamicType: true,
+			},
+		},
+		Type: function.StaticReturnType(cty.String),
+		Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
+			// conver the file path to an absolute
+			fp := ensureAbsolute(args[0].AsString(), path)
 
-	diag := gohcl.DecodeBody(b.Body, ctx, p)
-	if diag.HasErrors() {
-		return errors.New(diag.Error())
-	}
+			// read the contents of the file
+			d, err := ioutil.ReadFile(fp)
+			if err != nil {
+				return cty.StringVal(""), err
+			}
 
-	return nil
-}
-
-// ensureAbsolute ensure that the given path is either absolute or
-// if relative is converted to abasolute based on the path of the config
-func ensureAbsolute(path, file string) string {
-	// if the file starts with a / and we are on windows
-	// we should treat this as absolute
-	if runtime.GOOS == "windows" && strings.HasPrefix(path, "/") {
-		return path
-	}
-
-	if filepath.IsAbs(path) {
-		return path
-	}
-
-	// path is relative so make absolute using the current file path as base
-	file, _ = filepath.Abs(file)
-	baseDir := filepath.Dir(file)
-	return filepath.Join(baseDir, path)
-}
-
-func getFiles(source, dest string) error {
-	pwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-
-	// if the argument is a url fetch it first
-	c := &getter.Client{
-		Ctx:     context.Background(),
-		Src:     source,
-		Dst:     dest,
-		Pwd:     pwd,
-		Mode:    getter.ClientModeAny,
-		Options: []getter.ClientOption{},
-	}
-
-	err = c.Get()
-	if err != nil {
-		return xerrors.Errorf("unable to fetch files from %s: %w", source, err)
-	}
-
-	return nil
-}
-
-// setDisabled sets the disabled flag on a resource when the
-// parent is disabled
-func setDisabled(r Resource, parentDisabled bool) {
-	if parentDisabled {
-		r.Info().Disabled = true
-	}
-
-	// when the resource is disabled set the status
-	// so the engine will not create or delete it
-	if r.Info().Disabled {
-		r.Info().Status = "disabled"
-	}
+			return cty.StringVal(string(d)), nil
+		},
+	})
 }

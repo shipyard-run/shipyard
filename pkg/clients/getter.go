@@ -79,7 +79,7 @@ func (g *GetterImpl) Get(uri, dst string) error {
 
 	err = g.get(uri, dst, pwd)
 	if err != nil {
-		return xerrors.Errorf("unable to fetch files from %s: %w", uri, err)
+		return xerrors.Errorf("Unable to fetch files from %s dest: %s working: %s: %w", uri, dst, pwd, err)
 	}
 
 	return nil

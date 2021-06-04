@@ -1,8 +1,9 @@
-package config
+package parser
 
 import (
 	"testing"
 
+	"github.com/shipyard-run/shipyard/pkg/config"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -14,8 +15,8 @@ func TestNomadIngressCreatesCorrectly(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, "test", cl.Info().Name)
-	assert.Equal(t, TypeNomadIngress, cl.Info().Type)
-	assert.Equal(t, PendingCreation, cl.Info().Status)
+	assert.Equal(t, config.TypeNomadIngress, cl.Info().Type)
+	assert.Equal(t, config.PendingCreation, cl.Info().Status)
 }
 
 func TestNomadIngressSetsDisabled(t *testing.T) {
@@ -25,7 +26,7 @@ func TestNomadIngressSetsDisabled(t *testing.T) {
 	cl, err := c.FindResource("nomad_ingress.test")
 	assert.NoError(t, err)
 
-	assert.Equal(t, Disabled, cl.Info().Status)
+	assert.Equal(t, config.Disabled, cl.Info().Status)
 }
 
 const nomadIngressDefault = `
