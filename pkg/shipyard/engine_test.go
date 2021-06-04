@@ -12,7 +12,9 @@ import (
 
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/hashicorp/go-hclog"
+	clmocks "github.com/shipyard-run/shipyard/pkg/clients/mocks"
 	"github.com/shipyard-run/shipyard/pkg/config"
+	"github.com/shipyard-run/shipyard/pkg/parser"
 	"github.com/shipyard-run/shipyard/pkg/providers"
 	"github.com/shipyard-run/shipyard/pkg/providers/mocks"
 	"github.com/shipyard-run/shipyard/pkg/utils"
@@ -66,6 +68,8 @@ func setupTestsBase(returnVals map[string]error, state string) (Engine, *[]*mock
 	p := &[]*mocks.MockProvider{}
 
 	cl := &Clients{}
+	cl.Getter = &clmocks.Getter{}
+	cl.Parser = parser.New(cl.Getter)
 	e := &EngineImpl{
 		clients:     cl,
 		log:         hclog.NewNullLogger(),
