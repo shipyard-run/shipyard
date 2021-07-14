@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"fmt"
-
+	"os"
+	
 	"github.com/hashicorp/go-hclog"
 	"github.com/shipyard-run/shipyard/pkg/shipyard"
 	"github.com/shipyard-run/shipyard/pkg/utils"
@@ -28,17 +29,18 @@ var date string    // set by build process
 var commit string  // set by build process
 
 func init() {
+	
 	var vm gvm.Versions
-
+	
 	// setup dependencies
 	logger = createLogger()
 	engine, vm = createEngine(logger)
 	engineClients = engine.GetClients()
-
+	
 	//cobra.OnInitialize(configure)
-
+	
 	//rootCmd.PersistentFlags().StringVar(&configFile, "config", "", "config file (default is $HOME/.shipyard/config)")
-
+	
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(checkCmd)
 	rootCmd.AddCommand(outputCmd)
@@ -56,7 +58,7 @@ func init() {
 	rootCmd.AddCommand(newVersionCmd(vm))
 	rootCmd.AddCommand(uninstallCmd)
 	rootCmd.AddCommand(newPushCmd(engineClients.ContainerTasks, engineClients.Kubernetes, engineClients.HTTP, engineClients.Nomad, logger))
-
+	rootCmd.AddCommand(logCmd(os.Stdout, engine))
 	// add the server commands
 	rootCmd.AddCommand(connectorCmd)
 	connectorCmd.AddCommand(newConnectorRunCommand())

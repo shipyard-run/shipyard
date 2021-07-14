@@ -6,6 +6,7 @@ require (
 	github.com/Masterminds/semver v1.5.0
 	github.com/MichaelMure/go-term-markdown v0.1.3
 	github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 // indirect
+	github.com/TwinProduction/go-color v1.0.0
 	github.com/aws/aws-sdk-go v1.33.5 // indirect
 	github.com/creack/pty v1.1.11
 	github.com/cucumber/godog v0.10.0
